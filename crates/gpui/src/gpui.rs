@@ -16,6 +16,8 @@ mod bounds_tree;
 mod color;
 /// The default colors used by GPUI.
 pub mod colors;
+/// Simplified Chinese translations for interface text.
+pub mod localization;
 #[cfg(feature = "profiler")]
 mod debug_overlay;
 mod element;

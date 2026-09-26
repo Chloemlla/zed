@@ -627,10 +627,25 @@ impl TextLayout {
     fn layout(
         &self,
         text: SharedString,
-        runs: Option<Vec<TextRun>>,
+        mut runs: Option<Vec<TextRun>>,
         window: &mut Window,
         _: &mut App,
     ) -> LayoutId {
+        // Styled runs carry byte offsets into the text they were built from, so
+        // they cannot survive a translation that changes its length: text that
+        // has a translation is shaped with a single run instead.
+        let text = if runs.is_some() {
+            match crate::localization::translate(text.as_ref()) {
+                Some(translated) => {
+                    runs = None;
+                    SharedString::from(translated)
+                }
+                None => text,
+            }
+        } else {
+            crate::localization::translate_shared_string(text)
+        };
+
         let text_style = window.text_style();
         let font_size = text_style.font_size.to_pixels(window.rem_size());
         let line_height = window.pixel_snap(
