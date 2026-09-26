@@ -4,12 +4,21 @@ name: Release (zh-CN)
 # the same three triggers as the meatshell pipeline:
 #
 #  - push a tag like `v1.21.0-zh.1` -> builds every platform and attaches the
-#    bundles to a GitHub Release for that tag;
+#    bundles to the GitHub Release for that tag;
 #  - push to `main`                 -> real-time multi-platform build, and when
-#    all of them succeed the bundles are published as `v<version>-ci-<sha>`
-#    (the "automatic release" pattern);
+#    all of them succeed the bundles are published straight away as the
+#    official release of the version in `crates/zed/Cargo.toml`: tagged
+#    `v<version>`, named after that version and marked "Latest". A second push
+#    without a version bump updates that same release (assets are overwritten),
+#    so "Latest" always points at the newest successful build of `main`.
 #  - run manually (workflow_dispatch) -> builds every platform and keeps the
 #    bundles as downloadable workflow artifacts, without creating a release.
+#
+# Every build compiles with the `stable` release channel, so the app presents
+# itself as "Zed" (not "Zed Dev"/"Zed Devel") with the stable icons and bundle
+# identifiers: these are official release binaries, not dev builds. Auto-updates
+# are compiled out via ZED_UPDATE_EXPLANATION, because a stable-channel build
+# would otherwise poll zed.dev and replace this fork with upstream Zed.
 #
 # Zed's own release pipeline only runs for the zed-industries owner, on
 # Namespace runners, and it needs Zed's code-signing and blob-store credentials.
@@ -113,6 +122,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # These jobs publish official releases, so they must not compile as `dev`:
+      # the channel is baked into the binary from this file (see
+      # `release_channel::compile_time_release_channel_name`), and `dev` names the
+      # app "Zed Dev"/"Zed Devel", ships the dev icon and claims the dev bundle
+      # identifier. Upstream's nightly workflow rewrites this very same file to
+      # `nightly` before building.
+      - name: Set release channel to stable
+        shell: bash
+        run: |
+          set -eu
+          echo "stable" > crates/zed/RELEASE_CHANNEL
+          cat crates/zed/RELEASE_CHANNEL
+
       # Zed's checkout blows through Windows' 260 character path limit.
       - name: Enable long paths (Windows)
         if: matrix.bundle == 'windows'
@@ -187,6 +209,13 @@ jobs:
         env:
           CC: clang-18
           CXX: clang++-18
+          # `windows_resources`/`release_channel` read RELEASE_CHANNEL at compile
+          # time, and the app product version is built from it.
+          RELEASE_CHANNEL: stable
+          # Compile-time switch (the same one nix builds use) that disables
+          # auto-update polling: a stable-channel build otherwise asks zed.dev
+          # for upstream Zed and would silently replace this fork.
+          ZED_UPDATE_EXPLANATION: "本版本为 Zed 汉化版，不支持自动更新，请到 https://github.com/Chloemlla/zed/releases/latest 下载新版本。"
         run: ./script/bundle-linux
 
       # bundle-mac installs the pinned cargo-bundle fork itself when the version
@@ -194,6 +223,9 @@ jobs:
       - name: Build (macOS)
         if: matrix.bundle == 'mac'
         shell: bash
+        env:
+          RELEASE_CHANNEL: stable
+          ZED_UPDATE_EXPLANATION: "本版本为 Zed 汉化版，不支持自动更新，请到 https://github.com/Chloemlla/zed/releases/latest 下载新版本。"
         run: ./script/bundle-mac ${{ matrix.target }}
 
       # Upstream runs script/bundle-windows.ps1 here, which additionally needs
@@ -203,6 +235,9 @@ jobs:
       - name: Build (Windows)
         if: matrix.bundle == 'windows'
         shell: bash
+        env:
+          RELEASE_CHANNEL: stable
+          ZED_UPDATE_EXPLANATION: "本版本为 Zed 汉化版，不支持自动更新，请到 https://github.com/Chloemlla/zed/releases/latest 下载新版本。"
         run: cargo --config .cargo/bundle-config.toml build --release --package zed --package cli --target ${{ matrix.target }}
 
       - name: Package
@@ -256,29 +291,38 @@ jobs:
         with:
           files: dist/*
           fail_on_unmatched_files: true
+          draft: false
+          # A fork tag is the official release of that build, so it is never a
+          # prerelease and is allowed to take over the "Latest" badge.
+          prerelease: false
+          make_latest: true
 
-  # Automatic release for real-time builds on `main` (the meatshell/Project-Lumen
-  # pattern): collect every platform bundle and publish them under a
-  # `v<version>-ci-<short-sha>` tag. Tag pushes keep their own release path, and
+  # Publishing step for real-time builds on `main`: collect every platform
+  # bundle and publish them immediately as the official release of the version
+  # currently in `crates/zed/Cargo.toml` - tag `v<version>`, marked "Latest",
+  # neither a draft nor a prerelease. Re-running it for the same version updates
+  # that same release and overwrites its assets, which keeps "Latest" on the
+  # newest successful `main` build. Tag pushes keep their own release path, and
   # manual dispatches stay artifact-only.
-  ci-release:
-    name: ci-build-auto-release
+  publish-release:
+    name: publish-release
     needs: build
     if: github.event_name == 'push' && github.ref_type == 'branch'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
-      - name: Compute CI release tag
-        id: ci_tag
+      - name: Compute release version
+        id: release
         shell: bash
         run: |
           set -eu
           VERSION="$(sed -n '/^\[package\]/,/^\[/ s/^version = "\(.*\)"/\1/p' crates/zed/Cargo.toml | head -n 1)"
-          SHORT_SHA="${GITHUB_SHA::8}"
-          echo "ci_version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "ci_short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
-          echo "ci_tag=v${VERSION}-ci-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          [ -n "$VERSION" ] || { echo "could not read the zed crate version"; exit 1; }
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Download all build artifacts
         uses: actions/download-artifact@v4
@@ -292,23 +336,34 @@ jobs:
           mkdir -p release-assets
           find ci-artifacts -type f -exec cp -n {} release-assets/ \;
           # Branch builds are packaged as "zed-main-..."; relabel them with the
-          # real version so download names match the tag.
+          # real version so download names match the release tag.
           cd release-assets
           for file in zed-main-*; do
             [ -e "$file" ] || continue
-            mv "$file" "zed-${{ steps.ci_tag.outputs.ci_version }}-${file#zed-main-}"
+            mv "$file" "zed-${{ steps.release.outputs.version }}-${file#zed-main-}"
           done
           echo "Assembled release assets:"
           ls -lh
 
-      - name: Automatic release
+      - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          tag_name: ${{ steps.ci_tag.outputs.ci_tag }}
-          name: "Zed 汉化版 ${{ steps.ci_tag.outputs.ci_version }} CI build ${{ steps.ci_tag.outputs.ci_short_sha }}"
+          tag_name: ${{ steps.release.outputs.tag }}
+          # Creates the `v<version>` tag on the very commit that was built, even if
+          # `main` has moved on while the builds were running.
+          target_commitish: ${{ github.sha }}
+          name: "Zed 汉化版 ${{ steps.release.outputs.version }}"
+          body: |
+            Zed 汉化版 ${{ steps.release.outputs.version }} 正式版（stable 发布渠道，非 dev 构建）。
+
+            - 构建提交：`${{ github.sha }}`
+            - 构建记录：${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            - 安装包见下方 Assets（Windows / macOS / Linux，x86_64 与 aarch64）
+
+            同一版本号再次构建会覆盖更新本 Release 的 Assets，"Latest" 始终指向 main 上最新一次成功的构建。
           draft: false
           prerelease: false
           make_latest: true
-          generate_release_notes: true
+          overwrite_files: true
           files: release-assets/*
