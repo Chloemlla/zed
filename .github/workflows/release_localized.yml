@@ -91,16 +91,22 @@ jobs:
             bundle: linux
             arch: x86_64
           - name: linux-aarch64
-            os: ubuntu-22.04-arm # free native arm64 runner (public repos)
+            os: ubuntu-24.04-arm # free native arm64 runner (public repos).
+            # Not interchangeable with 22.04: Livekit's prebuilt libwebrtc.a for
+            # arm64 is built with GCC 14 and references __arm_tpidr2_save, the
+            # FEAT_THE based 128-bit atomic helper that only libatomic from GCC
+            # 14 (Ubuntu 24.04) provides; lld on 22.04 fails the final link.
+            # The arm64 binary therefore needs glibc >= 2.39, while x86_64 keeps
+            # the low 22.04 baseline.
             bundle: linux
             arch: aarch64
           - name: macos-aarch64
-            os: macos-14
+            os: macos-latest
             bundle: mac
             target: aarch64-apple-darwin
             dmg: Zed-aarch64.dmg
           - name: macos-x86_64
-            os: macos-14 # cross-compiled on Apple Silicon, like upstream does
+            os: macos-latest # cross-compiled on Apple Silicon, like upstream does
             bundle: mac
             target: x86_64-apple-darwin
             dmg: Zed-x86_64.dmg
@@ -140,6 +146,23 @@ jobs:
           node-version: "24"
           check-latest: true
           package-manager-cache: false
+
+      # webrtc-sys' cxxbridge headers do not compile against the libc++ that
+      # ships with Xcode 15.x: every translation unit dies on
+      # `implicit instantiation of undefined template
+      # 'std::__pointer_traits_element_type<rust::Slice<...>::iterator>'`
+      # in the SDK's pointer_traits.h. Pick the newest Xcode the image offers
+      # instead of trusting the image default.
+      - name: Select Xcode (macOS)
+        if: matrix.bundle == 'mac'
+        shell: bash
+        run: |
+          set -eu
+          latest="$(ls -d /Applications/Xcode_*.app | sort -V | tail -n 1)"
+          echo "switching to ${latest}"
+          sudo xcode-select --switch "${latest}/Contents/Developer"
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-version
 
       - name: Clear target directory if large
         if: matrix.bundle != 'windows'
