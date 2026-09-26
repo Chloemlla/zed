@@ -9,29 +9,18 @@ use zed_actions::feedback::{EmailZed, FileBugReport, RequestFeature};
 actions!(
     zed,
     [
-        /// Opens the Zed repository on GitHub.
+        /// Opens this fork's release page on GitHub.
         OpenZedRepo,
         /// Copies installed extensions to the clipboard for bug reports.
         CopyInstalledExtensionsIntoClipboard
     ]
 );
 
-const ZED_REPO_URL: &str = "https://github.com/zed-industries/zed";
-
-const REQUEST_FEATURE_URL: &str = "https://github.com/zed-industries/zed/discussions/new/choose";
-
-fn file_bug_report_url(specs: &SystemSpecs) -> String {
-    format!(
-        concat!(
-            "https://github.com/zed-industries/zed/issues/new",
-            "?",
-            "template=10_bug_report.yml",
-            "&",
-            "environment={}"
-        ),
-        urlencoding::encode(&specs.to_string())
-    )
-}
+// This is a fork of Zed. Upstream's repository, issue tracker and discussion
+// board all describe a build without the localization, so every "go to the
+// project" action here - the repository, a bug report, a feature request -
+// sends users to our own release page instead. See
+// `client::zed_urls::RELEASES_URL`.
 
 fn email_zed_url(specs: &SystemSpecs) -> String {
     format!(
@@ -82,19 +71,10 @@ pub fn init(cx: &mut App) {
                 ));
             })
             .register_action(|_, _: &RequestFeature, _, cx| {
-                cx.open_url(REQUEST_FEATURE_URL);
+                cx.open_url(client::zed_urls::RELEASES_URL);
             })
-            .register_action(move |_, _: &FileBugReport, window, cx| {
-                let specs =
-                    SystemSpecs::new(window, cx, telemetry::os_name(), telemetry::os_version());
-                cx.spawn_in(window, async move |_, cx| {
-                    let specs = specs.await;
-                    cx.update(|_, cx| {
-                        cx.open_url(&file_bug_report_url(&specs));
-                    })
-                    .log_err();
-                })
-                .detach();
+            .register_action(|_, _: &FileBugReport, _, cx| {
+                cx.open_url(client::zed_urls::RELEASES_URL);
             })
             .register_action(move |_, _: &EmailZed, window, cx| {
                 let specs =
@@ -109,7 +89,7 @@ pub fn init(cx: &mut App) {
                 .detach();
             })
             .register_action(move |_, _: &OpenZedRepo, _, cx| {
-                cx.open_url(ZED_REPO_URL);
+                cx.open_url(client::zed_urls::RELEASES_URL);
             });
     })
     .detach();

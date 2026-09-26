@@ -3,12 +3,25 @@
 //! These URLs will adapt to the configured server URL in order to construct
 //! links appropriate for the environment (e.g., by linking to a local copy of
 //! zed.dev in development).
+//!
+//! [`RELEASES_URL`], by contrast, is a fixed address: it is where this fork
+//! publishes itself, so every in-app pointer at "the project" uses it.
 
 use gpui::App;
 use release_channel::ReleaseChannel;
 use settings::Settings;
 
 use crate::ClientSettings;
+
+/// The page that publishes releases of this build of Zed.
+///
+/// This tree is a simplified-Chinese fork of Zed, so every address in the app
+/// that points at "the project" - the Help menu's release entry, "Update Zed",
+/// release notes, bug reports - resolves here instead of to zed.dev or to
+/// upstream's repository, where users would download a build without this
+/// localization. Unlike the helpers below it is deliberately not derived from
+/// `server_url`.
+pub const RELEASES_URL: &str = "https://github.com/Chloemlla/zed/releases/latest";
 
 fn server_url(cx: &App) -> &str {
     &ClientSettings::get_global(cx).server_url
