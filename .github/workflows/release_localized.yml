@@ -1,0 +1,291 @@
+name: Release (zh-CN)
+
+# Multi-platform build and GitHub Release for this Simplified Chinese fork, on
+# the same three triggers as the meatshell pipeline:
+#
+#  - push a tag like `v1.21.0-zh.1` -> builds every platform and attaches the
+#    bundles to a GitHub Release for that tag;
+#  - push to `main`                 -> real-time multi-platform build, and when
+#    all of them succeed the bundles are published as `v<version>-ci-<sha>`
+#    (the "automatic release" pattern);
+#  - run manually (workflow_dispatch) -> builds every platform and keeps the
+#    bundles as downloadable workflow artifacts, without creating a release.
+#
+# Zed's own release pipeline only runs for the zed-industries owner, on
+# Namespace runners, and it needs Zed's code-signing and blob-store credentials.
+# This workflow builds on plain GitHub-hosted runners instead, but drives the
+# very same `script/bundle-*` entry points, so the artifacts are shaped like
+# upstream's. Without signing credentials `script/bundle-mac` falls back to
+# ad-hoc signing, so the first launch of a .dmg needs right-click > Open.
+
+on:
+  push:
+    tags: ["v*"]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write # needed to create and update the GitHub Release
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  check-version:
+    name: Check tag version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # A fork tag carries a suffix after the upstream version, so that the same
+      # Zed revision can be released more than once: v1.21.0, v1.21.0-zh.1, ...
+      - name: Ensure tag matches the version of the zed crate
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          set -eu
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          CARGO_VERSION="$(sed -n '/^\[package\]/,/^\[/ s/^version = "\(.*\)"/\1/p' crates/zed/Cargo.toml | head -n 1)"
+          LOCK_VERSION="$(awk '
+            $0 == "name = \"zed\"" { found = 1; next }
+            found && $1 == "version" {
+              gsub(/"/, "", $3)
+              print $3
+              exit
+            }
+          ' Cargo.lock)"
+          case "$TAG_VERSION" in
+            "$CARGO_VERSION"|"$CARGO_VERSION"-*) ;;
+            *)
+              echo "Tag ${GITHUB_REF_NAME} does not start with the zed crate version ${CARGO_VERSION}."
+              echo "Use v${CARGO_VERSION} or v${CARGO_VERSION}-<suffix>."
+              exit 1
+              ;;
+          esac
+          if [ "$CARGO_VERSION" != "$LOCK_VERSION" ]; then
+            echo "Cargo.lock pins zed ${LOCK_VERSION}, but crates/zed/Cargo.toml says ${CARGO_VERSION}."
+            echo "Commit the lock file update before tagging."
+            exit 1
+          fi
+
+  build:
+    name: ${{ matrix.name }}
+    needs: check-version
+    runs-on: ${{ matrix.os }}
+    # Zed is ~250 crates and ~1500 dependencies; a cold release build on a
+    # 4-vCPU runner takes hours, so do not let the default 360 minutes clip it.
+    timeout-minutes: 600
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x86_64
+            os: windows-latest
+            bundle: windows
+            target: x86_64-pc-windows-msvc
+          # Build Linux on the oldest supported runner, for a low glibc baseline.
+          - name: linux-x86_64
+            os: ubuntu-22.04
+            bundle: linux
+            arch: x86_64
+          - name: linux-aarch64
+            os: ubuntu-22.04-arm # free native arm64 runner (public repos)
+            bundle: linux
+            arch: aarch64
+          - name: macos-aarch64
+            os: macos-14
+            bundle: mac
+            target: aarch64-apple-darwin
+            dmg: Zed-aarch64.dmg
+          - name: macos-x86_64
+            os: macos-14 # cross-compiled on Apple Silicon, like upstream does
+            bundle: mac
+            target: x86_64-apple-darwin
+            dmg: Zed-x86_64.dmg
+    steps:
+      - uses: actions/checkout@v4
+
+      # Zed's checkout blows through Windows' 260 character path limit.
+      - name: Enable long paths (Windows)
+        if: matrix.bundle == 'windows'
+        shell: powershell
+        run: |
+          git config --system core.longpaths true
+          New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" `
+            -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force
+
+      # script/linux installs the toolchain-adjacent packages Zed links against
+      # (alsa, fontconfig, libgit2, openssl, zstd, lld for aarch64, ...) plus
+      # rustup itself, which is what the pinned rust-toolchain.toml needs.
+      - name: Install Linux build dependencies
+        if: matrix.bundle == 'linux'
+        shell: bash
+        run: |
+          set -eu
+          ./script/linux
+          ./script/download-wasi-sdk
+          # libwebrtc needs a clang with usable C++20 support; upstream builds
+          # with clang-18 and passes it through CC/CXX below.
+          wget -q https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 18
+
+      # script/bundle-mac dresses the .dmg with a license pane through npm.
+      - name: Set up Node (macOS)
+        if: matrix.bundle == 'mac'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          check-latest: true
+          package-manager-cache: false
+
+      - name: Clear target directory if large
+        if: matrix.bundle != 'windows'
+        shell: bash
+        run: ./script/clear-target-dir-if-larger-than 100 70
+
+      # Only the downloaded crates are worth caching here: Zed's own `target/`
+      # grows far past GitHub's 10GB per-cache limit, so archiving it would burn
+      # tens of minutes on every run to save nothing.
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+          cache-targets: false
+
+      # Zed has neither the telemetry checksum seed nor a Sentry endpoint for a
+      # fork build; both are read through `option_env!` and guarded by
+      # `is_some()`, so leaving them out only turns telemetry off.
+      - name: Build (Linux)
+        if: matrix.bundle == 'linux'
+        shell: bash
+        env:
+          CC: clang-18
+          CXX: clang++-18
+        run: ./script/bundle-linux
+
+      # bundle-mac installs the pinned cargo-bundle fork itself when the version
+      # does not match, and ad-hoc signs the app when no certificate is present.
+      - name: Build (macOS)
+        if: matrix.bundle == 'mac'
+        shell: bash
+        run: ./script/bundle-mac ${{ matrix.target }}
+
+      # Upstream runs script/bundle-windows.ps1 here, which additionally needs
+      # Inno Setup, the AGS SDK, ConPTY and code-signing credentials. The
+      # editor and the `zed` launcher are what a release needs, so build those
+      # with the same cargo config and the same package list the script uses.
+      - name: Build (Windows)
+        if: matrix.bundle == 'windows'
+        shell: bash
+        run: cargo --config .cargo/bundle-config.toml build --release --package zed --package cli --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          set -eu
+          VERSION="${GITHUB_REF_NAME:-main}"
+          rm -rf dist
+          mkdir -p dist
+
+          case "${{ matrix.bundle }}" in
+            linux)
+              arch="${{ matrix.arch }}"
+              cp "target/release/zed-linux-${arch}.tar.gz" \
+                "dist/zed-${VERSION}-${{ matrix.name }}.tar.gz"
+              cp "target/zed-remote-server-linux-${arch}.gz" \
+                "dist/zed-remote-server-${VERSION}-linux-${arch}.gz"
+              ;;
+            mac)
+              arch="${{ matrix.target }}"
+              arch="${arch%%-*}"
+              cp "target/${{ matrix.target }}/release/${{ matrix.dmg }}" \
+                "dist/zed-${VERSION}-${{ matrix.name }}.dmg"
+              cp "target/zed-remote-server-macos-${arch}.gz" \
+                "dist/zed-remote-server-${VERSION}-macos-${arch}.gz"
+              ;;
+            windows)
+              stage="zed-${VERSION}-${{ matrix.name }}"
+              rm -rf "$stage"
+              mkdir -p "$stage"
+              cp "target/${{ matrix.target }}/release/zed.exe" "$stage/"
+              cp "target/${{ matrix.target }}/release/cli.exe" "$stage/zed-cli.exe"
+              cp README.md LICENSE-APACHE LICENSE-GPL "$stage/"
+              7z a "${stage}.zip" "$stage" >/dev/null
+              mv "${stage}.zip" "dist/"
+              ;;
+          esac
+
+          echo "Bundled artifacts:"
+          ls -lh dist
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/*
+
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true
+
+  # Automatic release for real-time builds on `main` (the meatshell/Project-Lumen
+  # pattern): collect every platform bundle and publish them under a
+  # `v<version>-ci-<short-sha>` tag. Tag pushes keep their own release path, and
+  # manual dispatches stay artifact-only.
+  ci-release:
+    name: ci-build-auto-release
+    needs: build
+    if: github.event_name == 'push' && github.ref_type == 'branch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute CI release tag
+        id: ci_tag
+        shell: bash
+        run: |
+          set -eu
+          VERSION="$(sed -n '/^\[package\]/,/^\[/ s/^version = "\(.*\)"/\1/p' crates/zed/Cargo.toml | head -n 1)"
+          SHORT_SHA="${GITHUB_SHA::8}"
+          echo "ci_version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "ci_short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+          echo "ci_tag=v${VERSION}-ci-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ci-artifacts
+
+      - name: Flatten artifacts into release assets
+        shell: bash
+        run: |
+          set -eu
+          mkdir -p release-assets
+          find ci-artifacts -type f -exec cp -n {} release-assets/ \;
+          # Branch builds are packaged as "zed-main-..."; relabel them with the
+          # real version so download names match the tag.
+          cd release-assets
+          for file in zed-main-*; do
+            [ -e "$file" ] || continue
+            mv "$file" "zed-${{ steps.ci_tag.outputs.ci_version }}-${file#zed-main-}"
+          done
+          echo "Assembled release assets:"
+          ls -lh
+
+      - name: Automatic release
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: ${{ steps.ci_tag.outputs.ci_tag }}
+          name: "Zed 汉化版 ${{ steps.ci_tag.outputs.ci_version }} CI build ${{ steps.ci_tag.outputs.ci_short_sha }}"
+          draft: false
+          prerelease: false
+          make_latest: true
+          generate_release_notes: true
+          files: release-assets/*
