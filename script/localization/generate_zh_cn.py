@@ -17,10 +17,15 @@ placeholders are prose rather than arguments.
 Usage:
 
     python script/localization/generate_zh_cn.py <translations/zh-CN.json> \
-        <manifest/ui-strings.json> <output rust file>
+        <manifest/ui-strings.json> <output rust file> [actions json]
+
+The optional `actions json` defaults to `script/localization/actions_zh_cn.json`,
+which holds the names of Zed's actions (see `actions_zh_cn.py`). Catalogued
+strings win over action names when both cover the same text.
 """
 
 import json
+import os
 import re
 import sys
 
@@ -100,15 +105,32 @@ def load(translations_path: str, manifest_path: str) -> dict:
     return kept
 
 
+def load_actions(path: str) -> dict:
+    """Loads action names, if the file has been generated."""
+    if not path or not os.path.exists(path):
+        return {}
+    with open(path, encoding="utf-8") as handle:
+        return json.load(handle)
+
+
 def main() -> None:
     if len(sys.argv) != 4:
         raise SystemExit(__doc__)
 
     kept = load(sys.argv[1], sys.argv[2])
+    actions = load_actions(
+        sys.argv[4]
+        if len(sys.argv) > 4
+        else os.path.join(os.path.dirname(os.path.abspath(__file__)), "actions_zh_cn.json")
+    )
 
     exact = []
     patterns = []
     skipped_templates = 0
+    for source, translation in sorted(actions.items()):
+        if source not in kept:
+            exact.append((source, translation))
+
     for source, (translation, occurrences) in sorted(kept.items()):
         if "{" not in source:
             exact.append((source, translation))
@@ -183,7 +205,6 @@ def main() -> None:
         f"{len(exact)} verbatim strings, {len(anchored)} anchored patterns, "
         f"{len(leading)} leading patterns, {skipped_templates} templates skipped"
     )
-
 
 if __name__ == "__main__":
     main()
